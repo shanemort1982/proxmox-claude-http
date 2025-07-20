@@ -5,8 +5,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node mcp-http-server.js",
+    "dev": "node --watch mcp-http-server.js",
+    "start-rest": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
