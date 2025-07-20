@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import express from 'express';
+import cors from 'cors';
 import fetch from 'node-fetch';
 import https from 'https';
 import { readFileSync } from 'fs';
@@ -12,7 +11,7 @@ import { fileURLToPath } from 'url';
 // Load environment variables from .env file
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const envPath = join(__dirname, '../../.env');
+const envPath = join(__dirname, '.env');
 
 try {
   const envFile = readFileSync(envPath, 'utf8');
@@ -27,198 +26,190 @@ try {
   console.error('Warning: Could not load .env file:', error.message);
 }
 
-class ProxmoxServer {
+class ProxmoxClaudeServer {
   constructor() {
-    this.server = new Server(
-      {
-        name: 'proxmox-server',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
+    this.app = express();
+    this.port = process.env.PORT || 3000;
     
-    this.proxmoxHost = process.env.PROXMOX_HOST || '192.168.6.247';
-    this.proxmoxUser = process.env.PROXMOX_USER || 'root@pam';
-    this.proxmoxTokenName = process.env.PROXMOX_TOKEN_NAME || 'mcpserver';
-    this.proxmoxTokenValue = process.env.PROXMOX_TOKEN_VALUE;
+    // Proxmox configuration
+    this.proxmoxHost = process.env.PROXMOX_HOST;
     this.proxmoxPort = process.env.PROXMOX_PORT || '8006';
+    this.proxmoxUser = process.env.PROXMOX_USER || 'root@pam';
+    this.proxmoxTokenName = process.env.PROXMOX_TOKEN_NAME;
+    this.proxmoxTokenValue = process.env.PROXMOX_TOKEN_VALUE;
     this.allowElevated = process.env.PROXMOX_ALLOW_ELEVATED === 'true';
-    
-    // Create agent that accepts self-signed certificates
+
+    // Create HTTPS agent that ignores self-signed certificates
     this.httpsAgent = new https.Agent({
       rejectUnauthorized: false
     });
-    
-    this.setupToolHandlers();
+
+    this.setupMiddleware();
+    this.setupRoutes();
   }
 
-  async proxmoxRequest(endpoint, method = 'GET', body = null) {
-    const baseUrl = `https://${this.proxmoxHost}:${this.proxmoxPort}/api2/json`;
-    const url = `${baseUrl}${endpoint}`;
-    
+  setupMiddleware() {
+    // CORS for Claude Desktop
+    this.app.use(cors({
+      origin: '*',
+      methods: ['GET', 'POST', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization']
+    }));
+
+    this.app.use(express.json());
+  }
+
+  setupRoutes() {
+    // Health check
+    this.app.get('/health', (req, res) => {
+      res.json({
+        status: 'healthy',
+        server: 'proxmox-claude-http',
+        version: '1.0.0',
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // Get all Proxmox nodes
+    this.app.get('/api/nodes', async (req, res) => {
+      try {
+        const result = await this.getNodes();
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Get specific node status
+    this.app.get('/api/nodes/:node', async (req, res) => {
+      try {
+        const result = await this.getNodeStatus(req.params.node);
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Get all VMs
+    this.app.get('/api/vms', async (req, res) => {
+      try {
+        const { node, type = 'all' } = req.query;
+        const result = await this.getVMs(node, type);
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Get specific VM status
+    this.app.get('/api/vms/:node/:vmid', async (req, res) => {
+      try {
+        const { node, vmid } = req.params;
+        const { type = 'qemu' } = req.query;
+        const result = await this.getVMStatus(node, vmid, type);
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Execute VM command
+    this.app.post('/api/vms/:node/:vmid/exec', async (req, res) => {
+      try {
+        const { node, vmid } = req.params;
+        const { command, type = 'qemu' } = req.body;
+        const result = await this.executeVMCommand(node, vmid, command, type);
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Get storage
+    this.app.get('/api/storage', async (req, res) => {
+      try {
+        const { node } = req.query;
+        const result = await this.getStorage(node);
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Get cluster status
+    this.app.get('/api/cluster', async (req, res) => {
+      try {
+        const result = await this.getClusterStatus();
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Claude Desktop friendly endpoints with formatted responses
+    this.app.get('/claude/nodes', async (req, res) => {
+      try {
+        const result = await this.getNodes();
+        res.json({
+          response: result.content[0].text,
+          data: result
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.get('/claude/vms', async (req, res) => {
+      try {
+        const { node, type = 'all' } = req.query;
+        const result = await this.getVMs(node, type);
+        res.json({
+          response: result.content[0].text,
+          data: result
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.get('/claude/cluster', async (req, res) => {
+      try {
+        const result = await this.getClusterStatus();
+        res.json({
+          response: result.content[0].text,
+          data: result
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+  }
+
+  async proxmoxRequest(endpoint, method = 'GET', data = null) {
+    const url = `https://${this.proxmoxHost}:${this.proxmoxPort}/api2/json${endpoint}`;
     const headers = {
       'Authorization': `PVEAPIToken=${this.proxmoxUser}!${this.proxmoxTokenName}=${this.proxmoxTokenValue}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
     };
 
     const options = {
       method,
       headers,
-      agent: this.httpsAgent
+      agent: this.httpsAgent,
     };
 
-    if (body) {
-      options.body = JSON.stringify(body);
+    if (data && method !== 'GET') {
+      options.body = JSON.stringify(data);
     }
 
-    try {
-      const response = await fetch(url, options);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Proxmox API error: ${response.status} - ${errorText}`);
-      }
-      
-      const textResponse = await response.text();
-      if (!textResponse.trim()) {
-        throw new Error('Empty response from Proxmox API');
-      }
-      
-      const data = JSON.parse(textResponse);
-      return data.data;
-    } catch (error) {
-      if (error.name === 'SyntaxError') {
-        throw new Error(`Failed to parse Proxmox API response: ${error.message}`);
-      }
-      throw new Error(`Failed to connect to Proxmox: ${error.message}`);
+    const response = await fetch(url, options);
+    
+    if (!response.ok) {
+      throw new Error(`Proxmox API error: ${response.status} ${response.statusText}`);
     }
-  }
 
-  setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'proxmox_get_nodes',
-          description: 'List all Proxmox cluster nodes with their status and resources',
-          inputSchema: {
-            type: 'object',
-            properties: {}
-          }
-        },
-        {
-          name: 'proxmox_get_node_status',
-          description: 'Get detailed status information for a specific Proxmox node',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              node: { type: 'string', description: 'Node name (e.g., pve1, proxmox-node2)' }
-            },
-            required: ['node']
-          }
-        },
-        {
-          name: 'proxmox_get_vms',
-          description: 'List all virtual machines across the cluster with their status',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              node: { type: 'string', description: 'Optional: filter by specific node' },
-              type: { type: 'string', enum: ['qemu', 'lxc', 'all'], description: 'VM type filter', default: 'all' }
-            }
-          }
-        },
-        {
-          name: 'proxmox_get_vm_status',
-          description: 'Get detailed status information for a specific VM',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              node: { type: 'string', description: 'Node name where VM is located' },
-              vmid: { type: 'string', description: 'VM ID number' },
-              type: { type: 'string', enum: ['qemu', 'lxc'], description: 'VM type', default: 'qemu' }
-            },
-            required: ['node', 'vmid']
-          }
-        },
-        {
-          name: 'proxmox_execute_vm_command',
-          description: 'Execute a shell command on a virtual machine via Proxmox API',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              node: { type: 'string', description: 'Node name where VM is located' },
-              vmid: { type: 'string', description: 'VM ID number' },
-              command: { type: 'string', description: 'Shell command to execute' },
-              type: { type: 'string', enum: ['qemu', 'lxc'], description: 'VM type', default: 'qemu' }
-            },
-            required: ['node', 'vmid', 'command']
-          }
-        },
-        {
-          name: 'proxmox_get_storage',
-          description: 'List all storage pools and their usage across the cluster',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              node: { type: 'string', description: 'Optional: filter by specific node' }
-            }
-          }
-        },
-        {
-          name: 'proxmox_get_cluster_status',
-          description: 'Get overall cluster status including nodes and resource usage',
-          inputSchema: {
-            type: 'object',
-            properties: {}
-          }
-        }
-      ]
-    }));
-
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
-      try {
-        switch (name) {
-          case 'proxmox_get_nodes':
-            return await this.getNodes();
-            
-          case 'proxmox_get_node_status':
-            return await this.getNodeStatus(args.node);
-            
-          case 'proxmox_get_vms':
-            return await this.getVMs(args.node, args.type);
-            
-          case 'proxmox_get_vm_status':
-            return await this.getVMStatus(args.node, args.vmid, args.type);
-            
-          case 'proxmox_execute_vm_command':
-            return await this.executeVMCommand(args.node, args.vmid, args.command, args.type);
-            
-          case 'proxmox_get_storage':
-            return await this.getStorage(args.node);
-            
-          case 'proxmox_get_cluster_status':
-            return await this.getClusterStatus();
-            
-          default:
-            throw new Error(`Unknown tool: ${name}`);
-        }
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Error: ${error.message}`
-            }
-          ]
-        };
-      }
-    });
+    const result = await response.json();
+    return result.data;
   }
 
   async getNodes() {
@@ -228,108 +219,103 @@ class ProxmoxServer {
     
     for (const node of nodes) {
       const status = node.status === 'online' ? '🟢' : '🔴';
-      const uptime = node.uptime ? this.formatUptime(node.uptime) : 'N/A';
-      const cpuUsage = node.cpu ? `${(node.cpu * 100).toFixed(1)}%` : 'N/A';
-      const memUsage = node.mem && node.maxmem ? 
-        `${this.formatBytes(node.mem)} / ${this.formatBytes(node.maxmem)} (${((node.mem / node.maxmem) * 100).toFixed(1)}%)` : 'N/A';
-      
       output += `${status} **${node.node}**\n`;
       output += `   • Status: ${node.status}\n`;
-      output += `   • Uptime: ${uptime}\n`;
-      output += `   • CPU: ${cpuUsage}\n`;
-      output += `   • Memory: ${memUsage}\n`;
-      output += `   • Load: ${node.loadavg?.[0]?.toFixed(2) || 'N/A'}\n\n`;
+      output += `   • Uptime: ${node.uptime ? this.formatUptime(node.uptime) : 'N/A'}\n`;
+      output += `   • CPU: ${node.cpu ? `${(node.cpu * 100).toFixed(1)}%` : 'N/A'}\n`;
+      output += `   • Memory: ${node.mem && node.maxmem ? 
+        `${this.formatBytes(node.mem)} / ${this.formatBytes(node.maxmem)} (${((node.mem / node.maxmem) * 100).toFixed(1)}%)` : 'N/A'}\n`;
+      output += `   • Load: ${node.loadavg ? node.loadavg.join(', ') : 'N/A'}\n\n`;
     }
     
     return {
-      content: [{ type: 'text', text: output }]
+      content: [{ type: 'text', text: output }],
+      nodes: nodes
     };
   }
 
-  async getNodeStatus(node) {
-    if (!this.allowElevated) {
-      return {
-        content: [{ 
-          type: 'text', 
-          text: `⚠️  **Node Status Requires Elevated Permissions**\n\nTo view detailed node status, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file and ensure your API token has Sys.Audit permissions.\n\n**Current permissions**: Basic (node listing only)`
-        }]
-      };
-    }
+  async getNodeStatus(nodeName) {
+    const nodeStatus = await this.proxmoxRequest(`/nodes/${nodeName}/status`);
     
-    const status = await this.proxmoxRequest(`/nodes/${node}/status`);
-    
-    let output = `🖥️  **Node ${node} Status**\n\n`;
-    output += `• **Status**: ${status.uptime ? '🟢 Online' : '🔴 Offline'}\n`;
-    output += `• **Uptime**: ${status.uptime ? this.formatUptime(status.uptime) : 'N/A'}\n`;
-    output += `• **Load Average**: ${status.loadavg?.join(', ') || 'N/A'}\n`;
-    output += `• **CPU Usage**: ${status.cpu ? `${(status.cpu * 100).toFixed(1)}%` : 'N/A'}\n`;
-    output += `• **Memory**: ${status.memory ? 
-      `${this.formatBytes(status.memory.used)} / ${this.formatBytes(status.memory.total)} (${((status.memory.used / status.memory.total) * 100).toFixed(1)}%)` : 'N/A'}\n`;
-    output += `• **Root Disk**: ${status.rootfs ? 
-      `${this.formatBytes(status.rootfs.used)} / ${this.formatBytes(status.rootfs.total)} (${((status.rootfs.used / status.rootfs.total) * 100).toFixed(1)}%)` : 'N/A'}\n`;
+    let output = `🖥️  **Node: ${nodeName}**\n\n`;
+    output += `• **Status**: ${nodeStatus.uptime ? 'Online' : 'Offline'}\n`;
+    output += `• **Uptime**: ${nodeStatus.uptime ? this.formatUptime(nodeStatus.uptime) : 'N/A'}\n`;
+    output += `• **CPU Usage**: ${nodeStatus.cpu ? `${(nodeStatus.cpu * 100).toFixed(1)}%` : 'N/A'}\n`;
+    output += `• **Memory**: ${nodeStatus.memory ? 
+      `${this.formatBytes(nodeStatus.memory.used)} / ${this.formatBytes(nodeStatus.memory.total)} (${((nodeStatus.memory.used / nodeStatus.memory.total) * 100).toFixed(1)}%)` : 'N/A'}\n`;
+    output += `• **Load Average**: ${nodeStatus.loadavg ? nodeStatus.loadavg.join(', ') : 'N/A'}\n`;
+    output += `• **Root FS**: ${nodeStatus.rootfs ? 
+      `${this.formatBytes(nodeStatus.rootfs.used)} / ${this.formatBytes(nodeStatus.rootfs.total)} (${((nodeStatus.rootfs.used / nodeStatus.rootfs.total) * 100).toFixed(1)}%)` : 'N/A'}\n`;
     
     return {
-      content: [{ type: 'text', text: output }]
+      content: [{ type: 'text', text: output }],
+      nodeStatus: nodeStatus
     };
   }
 
-  async getVMs(nodeFilter = null, typeFilter = 'all') {
+  async getVMs(nodeName = null, type = 'all') {
     let vms = [];
     
-    if (nodeFilter) {
-      const nodeVMs = await this.proxmoxRequest(`/nodes/${nodeFilter}/qemu`);
-      const nodeLXCs = await this.proxmoxRequest(`/nodes/${nodeFilter}/lxc`);
-      
-      if (typeFilter === 'all' || typeFilter === 'qemu') {
-        vms.push(...nodeVMs.map(vm => ({ ...vm, type: 'qemu', node: nodeFilter })));
+    if (nodeName) {
+      // Get VMs from specific node
+      if (type === 'all' || type === 'qemu') {
+        const qemuVMs = await this.proxmoxRequest(`/nodes/${nodeName}/qemu`);
+        vms.push(...qemuVMs.map(vm => ({ ...vm, type: 'qemu', node: nodeName })));
       }
-      if (typeFilter === 'all' || typeFilter === 'lxc') {
-        vms.push(...nodeLXCs.map(vm => ({ ...vm, type: 'lxc', node: nodeFilter })));
+      if (type === 'all' || type === 'lxc') {
+        const lxcVMs = await this.proxmoxRequest(`/nodes/${nodeName}/lxc`);
+        vms.push(...lxcVMs.map(vm => ({ ...vm, type: 'lxc', node: nodeName })));
       }
     } else {
+      // Get VMs from all nodes
       const nodes = await this.proxmoxRequest('/nodes');
-      
       for (const node of nodes) {
-        if (typeFilter === 'all' || typeFilter === 'qemu') {
-          const nodeVMs = await this.proxmoxRequest(`/nodes/${node.node}/qemu`);
-          vms.push(...nodeVMs.map(vm => ({ ...vm, type: 'qemu', node: node.node })));
+        if (type === 'all' || type === 'qemu') {
+          try {
+            const qemuVMs = await this.proxmoxRequest(`/nodes/${node.node}/qemu`);
+            vms.push(...qemuVMs.map(vm => ({ ...vm, type: 'qemu', node: node.node })));
+          } catch (error) {
+            // Node might be offline, continue
+          }
         }
-        
-        if (typeFilter === 'all' || typeFilter === 'lxc') {
-          const nodeLXCs = await this.proxmoxRequest(`/nodes/${node.node}/lxc`);
-          vms.push(...nodeLXCs.map(vm => ({ ...vm, type: 'lxc', node: vm.node || node.node })));
+        if (type === 'all' || type === 'lxc') {
+          try {
+            const lxcVMs = await this.proxmoxRequest(`/nodes/${node.node}/lxc`);
+            vms.push(...lxcVMs.map(vm => ({ ...vm, type: 'lxc', node: node.node })));
+          } catch (error) {
+            // Node might be offline, continue
+          }
         }
       }
     }
     
     let output = '💻 **Virtual Machines**\n\n';
     
-    if (vms.length === 0) {
-      output += 'No virtual machines found.\n';
-    } else {
-      for (const vm of vms.sort((a, b) => parseInt(a.vmid) - parseInt(b.vmid))) {
-        const status = vm.status === 'running' ? '🟢' : vm.status === 'stopped' ? '🔴' : '🟡';
-        const typeIcon = vm.type === 'qemu' ? '🖥️' : '📦';
-        const uptime = vm.uptime ? this.formatUptime(vm.uptime) : 'N/A';
-        const cpuUsage = vm.cpu ? `${(vm.cpu * 100).toFixed(1)}%` : 'N/A';
-        const memUsage = vm.mem && vm.maxmem ? 
-          `${this.formatBytes(vm.mem)} / ${this.formatBytes(vm.maxmem)}` : 'N/A';
-        
-        output += `${status} ${typeIcon} **${vm.name || `VM-${vm.vmid}`}** (ID: ${vm.vmid})\n`;
-        output += `   • Node: ${vm.node}\n`;
-        output += `   • Status: ${vm.status}\n`;
-        output += `   • Type: ${vm.type.toUpperCase()}\n`;
-        if (vm.status === 'running') {
-          output += `   • Uptime: ${uptime}\n`;
-          output += `   • CPU: ${cpuUsage}\n`;
-          output += `   • Memory: ${memUsage}\n`;
-        }
-        output += '\n';
+    // Sort VMs by ID
+    vms.sort((a, b) => a.vmid - b.vmid);
+    
+    for (const vm of vms) {
+      const status = vm.status === 'running' ? '🟢' : vm.status === 'stopped' ? '🔴' : '🟡';
+      const typeIcon = vm.type === 'qemu' ? '🖥️' : '📦';
+      
+      output += `${status} ${typeIcon} **${vm.name || `VM-${vm.vmid}`}** (ID: ${vm.vmid})\n`;
+      output += `   • Node: ${vm.node}\n`;
+      output += `   • Status: ${vm.status}\n`;
+      output += `   • Type: ${vm.type.toUpperCase()}\n`;
+      
+      if (vm.status === 'running') {
+        output += `   • Uptime: ${vm.uptime ? this.formatUptime(vm.uptime) : 'N/A'}\n`;
+        output += `   • CPU: ${vm.cpu ? `${(vm.cpu * 100).toFixed(1)}%` : 'N/A'}\n`;
+        output += `   • Memory: ${vm.mem && vm.maxmem ? 
+          `${this.formatBytes(vm.mem)} / ${this.formatBytes(vm.maxmem)}` : 'N/A'}\n`;
       }
+      
+      output += '\n';
     }
     
     return {
-      content: [{ type: 'text', text: output }]
+      content: [{ type: 'text', text: output }],
+      vms: vms
     };
   }
 
@@ -356,7 +342,8 @@ class ProxmoxServer {
     }
     
     return {
-      content: [{ type: 'text', text: output }]
+      content: [{ type: 'text', text: output }],
+      vmStatus: vmStatus
     };
   }
 
@@ -384,7 +371,8 @@ class ProxmoxServer {
         output += `*Note: Use guest agent status to check command completion*`;
         
         return {
-          content: [{ type: 'text', text: output }]
+          content: [{ type: 'text', text: output }],
+          result: result
         };
       } else {
         // For LXC containers, we can execute directly
@@ -392,141 +380,103 @@ class ProxmoxServer {
           command: command
         });
         
-        let output = `📦 **Command executed on LXC ${vmid}**\n\n`;
+        let output = `📦 **Command executed on container ${vmid}**\n\n`;
         output += `**Command**: \`${command}\`\n`;
-        output += `**Output**:\n\`\`\`\n${result || 'Command executed successfully'}\n\`\`\``;
+        output += `**Output**: ${result.output || 'Command executed successfully'}\n`;
         
         return {
-          content: [{ type: 'text', text: output }]
+          content: [{ type: 'text', text: output }],
+          result: result
         };
       }
     } catch (error) {
       return {
         content: [{ 
           type: 'text', 
-          text: `❌ **Failed to execute command on VM ${vmid}**\n\nError: ${error.message}\n\n*Note: Make sure the VM has guest agent installed and running*` 
+          text: `❌ **Command execution failed**\n\n**Error**: ${error.message}\n\n*Note: Ensure the VM has guest agent installed and running (for QEMU VMs)*`
         }]
       };
     }
   }
 
-  async getStorage(nodeFilter = null) {
+  async getStorage(nodeName = null) {
     let storages = [];
     
-    if (nodeFilter) {
-      storages = await this.proxmoxRequest(`/nodes/${nodeFilter}/storage`);
-      storages = storages.map(storage => ({ ...storage, node: nodeFilter }));
+    if (nodeName) {
+      storages = await this.proxmoxRequest(`/nodes/${nodeName}/storage`);
+      storages = storages.map(storage => ({ ...storage, node: nodeName }));
     } else {
       const nodes = await this.proxmoxRequest('/nodes');
-      
       for (const node of nodes) {
-        const nodeStorages = await this.proxmoxRequest(`/nodes/${node.node}/storage`);
-        storages.push(...nodeStorages.map(storage => ({ ...storage, node: node.node })));
+        try {
+          const nodeStorages = await this.proxmoxRequest(`/nodes/${node.node}/storage`);
+          storages.push(...nodeStorages.map(storage => ({ ...storage, node: node.node })));
+        } catch (error) {
+          // Node might be offline, continue
+        }
       }
     }
     
     let output = '💾 **Storage Pools**\n\n';
     
-    if (storages.length === 0) {
-      output += 'No storage found.\n';
-    } else {
-      const uniqueStorages = [];
-      const seen = new Set();
+    for (const storage of storages) {
+      const usagePercent = storage.total ? ((storage.used / storage.total) * 100).toFixed(1) : 'N/A';
       
-      for (const storage of storages) {
-        const key = `${storage.storage}-${storage.node}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          uniqueStorages.push(storage);
-        }
-      }
-      
-      for (const storage of uniqueStorages.sort((a, b) => a.storage.localeCompare(b.storage))) {
-        const enabled = storage.enabled ? '🟢' : '🔴';
-        const usagePercent = storage.total && storage.used ? 
-          ((storage.used / storage.total) * 100).toFixed(1) : 'N/A';
-        
-        output += `${enabled} **${storage.storage}**\n`;
-        output += `   • Node: ${storage.node}\n`;
-        output += `   • Type: ${storage.type || 'N/A'}\n`;
-        output += `   • Content: ${storage.content || 'N/A'}\n`;
-        if (storage.total && storage.used) {
-          output += `   • Usage: ${this.formatBytes(storage.used)} / ${this.formatBytes(storage.total)} (${usagePercent}%)\n`;
-        }
-        output += `   • Status: ${storage.enabled ? 'Enabled' : 'Disabled'}\n\n`;
-      }
+      output += `📁 **${storage.storage}** (${storage.node})\n`;
+      output += `   • Type: ${storage.type}\n`;
+      output += `   • Status: ${storage.active ? '🟢 Active' : '🔴 Inactive'}\n`;
+      output += `   • Used: ${storage.used ? this.formatBytes(storage.used) : 'N/A'}\n`;
+      output += `   • Total: ${storage.total ? this.formatBytes(storage.total) : 'N/A'}\n`;
+      output += `   • Usage: ${usagePercent}%\n\n`;
     }
     
     return {
-      content: [{ type: 'text', text: output }]
+      content: [{ type: 'text', text: output }],
+      storages: storages
     };
   }
 
   async getClusterStatus() {
-    try {
-      const nodes = await this.proxmoxRequest('/nodes');
-      
-      // Try to get cluster status, but fall back gracefully if permissions are insufficient
-      let clusterStatus = null;
-      if (this.allowElevated) {
-        try {
-          clusterStatus = await this.proxmoxRequest('/cluster/status');
-        } catch (error) {
-          // Ignore cluster status errors for elevated permissions
-        }
+    const nodes = await this.proxmoxRequest('/nodes');
+    const cluster = await this.proxmoxRequest('/cluster/status');
+    
+    let output = '🏗️  **Proxmox Cluster Status**\n\n';
+    
+    // Cluster overview
+    const onlineNodes = nodes.filter(node => node.status === 'online').length;
+    const totalNodes = nodes.length;
+    
+    output += `**Cluster Health**: ${onlineNodes === totalNodes ? '🟢 Healthy' : '⚠️  Degraded'}\n`;
+    output += `**Nodes**: ${onlineNodes}/${totalNodes} online\n\n`;
+    
+    // Resource summary
+    let totalCPU = 0, usedCPU = 0, totalMem = 0, usedMem = 0;
+    
+    for (const node of nodes) {
+      if (node.status === 'online') {
+        totalCPU += node.maxcpu || 0;
+        usedCPU += (node.cpu || 0) * (node.maxcpu || 0);
+        totalMem += node.maxmem || 0;
+        usedMem += node.mem || 0;
       }
-      
-      let output = '🏗️  **Proxmox Cluster Status**\n\n';
-      
-      // Cluster overview
-      const onlineNodes = nodes.filter(n => n.status === 'online').length;
-      const totalNodes = nodes.length;
-      
-      output += `**Cluster Health**: ${onlineNodes === totalNodes ? '🟢 Healthy' : '🟡 Warning'}\n`;
-      output += `**Nodes**: ${onlineNodes}/${totalNodes} online\n\n`;
-      
-      if (this.allowElevated) {
-        // Resource summary (only available with elevated permissions)
-        let totalCpu = 0, usedCpu = 0;
-        let totalMem = 0, usedMem = 0;
-        
-        for (const node of nodes) {
-          if (node.status === 'online') {
-            totalCpu += node.maxcpu || 0;
-            usedCpu += (node.cpu || 0) * (node.maxcpu || 0);
-            totalMem += node.maxmem || 0;
-            usedMem += node.mem || 0;
-          }
-        }
-        
-        const cpuPercent = totalCpu > 0 ? ((usedCpu / totalCpu) * 100).toFixed(1) : 'N/A';
-        const memPercent = totalMem > 0 ? ((usedMem / totalMem) * 100).toFixed(1) : 'N/A';
-        
-        output += `**Resource Usage**:\n`;
-        output += `• CPU: ${cpuPercent}% (${usedCpu.toFixed(1)}/${totalCpu} cores)\n`;
-        output += `• Memory: ${memPercent}% (${this.formatBytes(usedMem)}/${this.formatBytes(totalMem)})\n\n`;
-      } else {
-        output += `⚠️  **Limited Information**: Resource usage requires elevated permissions\n\n`;
-      }
-      
-      // Node status
-      output += `**Node Details**:\n`;
-      for (const node of nodes.sort((a, b) => a.node.localeCompare(b.node))) {
-        const status = node.status === 'online' ? '🟢' : '🔴';
-        output += `${status} ${node.node} - ${node.status}\n`;
-      }
-      
-      return {
-        content: [{ type: 'text', text: output }]
-      };
-    } catch (error) {
-      return {
-        content: [{ 
-          type: 'text', 
-          text: `❌ **Failed to get cluster status**\n\nError: ${error.message}` 
-        }]
-      };
     }
+    
+    output += `**Resource Usage**:\n`;
+    output += `• CPU: ${usedCPU.toFixed(1)}/${totalCPU} cores (${((usedCPU / totalCPU) * 100).toFixed(1)}%)\n`;
+    output += `• Memory: ${this.formatBytes(usedMem)} / ${this.formatBytes(totalMem)} (${((usedMem / totalMem) * 100).toFixed(1)}%)\n\n`;
+    
+    // Node details
+    output += `**Node Details**:\n`;
+    for (const node of nodes) {
+      const status = node.status === 'online' ? '🟢' : '🔴';
+      output += `${status} ${node.node}: ${node.status}\n`;
+    }
+    
+    return {
+      content: [{ type: 'text', text: output }],
+      nodes: nodes,
+      cluster: cluster
+    };
   }
 
   formatUptime(seconds) {
@@ -551,12 +501,31 @@ class ProxmoxServer {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   }
 
-  async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('Proxmox MCP server running on stdio');
+  async start() {
+    // Validate required environment variables
+    if (!this.proxmoxHost) {
+      console.error('Error: PROXMOX_HOST environment variable is required');
+      process.exit(1);
+    }
+    if (!this.proxmoxTokenName) {
+      console.error('Error: PROXMOX_TOKEN_NAME environment variable is required');
+      process.exit(1);
+    }
+    if (!this.proxmoxTokenValue) {
+      console.error('Error: PROXMOX_TOKEN_VALUE environment variable is required');
+      process.exit(1);
+    }
+
+    this.app.listen(this.port, '0.0.0.0', () => {
+      console.log(`🚀 Proxmox Claude HTTP Server running on port ${this.port}`);
+      console.log(`📡 Health check: http://localhost:${this.port}/health`);
+      console.log(`🔧 API endpoints: http://localhost:${this.port}/api/*`);
+      console.log(`🤖 Claude endpoints: http://localhost:${this.port}/claude/*`);
+      console.log(`🏗️  Proxmox host: ${this.proxmoxHost}:${this.proxmoxPort}`);
+      console.log(`🔒 Elevated mode: ${this.allowElevated ? 'enabled' : 'disabled'}`);
+    });
   }
 }
 
-const server = new ProxmoxServer();
-server.run().catch(console.error);
+const server = new ProxmoxClaudeServer();
+server.start().catch(console.error);
