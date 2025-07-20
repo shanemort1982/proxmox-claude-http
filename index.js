@@ -49,6 +49,13 @@ class ProxmoxClaudeServer {
   }
 
   setupMiddleware() {
+    // Request logging
+    this.app.use((req, res, next) => {
+      console.log(`REQUEST: ${req.method} ${req.url} from ${req.ip}`);
+      console.log(`Headers:`, req.headers);
+      next();
+    });
+
     // CORS for Claude Desktop
     this.app.use(cors({
       origin: '*',
