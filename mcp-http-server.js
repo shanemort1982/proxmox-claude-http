@@ -41,11 +41,19 @@ class ProxmoxMCPServer {
 
     // Request logging
     this.app.use((req, res, next) => {
-      console.log(`📥 ${new Date().toISOString()} - ${req.method} ${req.url}`);
-      console.log(`📋 Headers:`, req.headers);
-      if (req.body) {
+      console.log(`📥 ${new Date().toISOString()} - ${req.method} ${req.url} from ${req.ip}`);
+      console.log(`📋 Headers:`, JSON.stringify(req.headers, null, 2));
+      if (req.body && Object.keys(req.body).length > 0) {
         console.log(`📦 Body:`, JSON.stringify(req.body, null, 2));
       }
+      
+      // Log response
+      const originalSend = res.send;
+      res.send = function(data) {
+        console.log(`📤 Response:`, data);
+        originalSend.call(this, data);
+      };
+      
       next();
     });
   }
@@ -76,6 +84,22 @@ class ProxmoxMCPServer {
         status: 'healthy', 
         server: 'Proxmox MCP over HTTP',
         proxmox: `${this.proxmoxConfig.host}:${this.proxmoxConfig.port}`
+      });
+    });
+
+    // Catch-all route to see what Claude Desktop is requesting
+    this.app.all('*', (req, res) => {
+      console.log(`❓ UNKNOWN REQUEST: ${req.method} ${req.url}`);
+      console.log(`📋 Headers:`, JSON.stringify(req.headers, null, 2));
+      if (req.body && Object.keys(req.body).length > 0) {
+        console.log(`📦 Body:`, JSON.stringify(req.body, null, 2));
+      }
+      
+      res.status(404).json({
+        error: 'Endpoint not found',
+        method: req.method,
+        url: req.url,
+        message: 'This is an MCP server. POST to / for MCP requests, GET /health for status'
       });
     });
   }
